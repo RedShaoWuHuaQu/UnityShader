@@ -1,0 +1,314 @@
+#pragma kernel UpdateSpectrum
+#pragma kernel IFFT_Horizontal
+#pragma kernel IFFT_Vertical
+#pragma kernel IFFT_Horizontal_FFT
+#pragma kernel IFFT_Horizontal_BitReverse
+#pragma kernel IFFT_Vertical_FFT
+#pragma kernel IFFT_Vertical_BitReverse
+#pragma kernel UpdateHeight
+#pragma kernel GetDisplacementFront
+#pragma kernel IFFT_Horizontal_Dis
+#pragma kernel IFFT_Vertical_Dis
+#define g 9.8
+#define PI 3.14159265358
+#define GROUPSIZE 8
+struct Water
+{
+    float2 kDir;
+    float4 positiveKAndNegetiveK;
+};
+
+RWStructuredBuffer<Water> buffer;
+RWTexture2D<float4> spectrumTex;
+float _Time;
+int texN;
+
+float2 ComplexMul(float2 t1, float2 t2)
+{
+    return float2(t1.x * t2.x - t1.y * t2.y, t1.x * t2.y + t1.y * t2.x);
+}
+
+[numthreads(GROUPSIZE, GROUPSIZE, 1)]
+void UpdateSpectrum (uint3 id : SV_DispatchThreadID)
+{
+    //texN是c#中定义的图像分辨率
+    int index = id.x * texN + id.y;
+    Water water = buffer[index];
+    float kLen = length(water.kDir);
+    //频率
+    float omega = sqrt(g * kLen);
+    //θ = ωt
+    float theta = omega * _Time;
+    float2 expFront = float2(cos(theta), sin(theta));
+    float2 expBehind = float2(cos(theta), -sin(theta));
+    float2 h = ComplexMul(water.positiveKAndNegetiveK.xy, expFront) + ComplexMul(water.positiveKAndNegetiveK.zw, expBehind);
+
+    spectrumTex[id.xy] = float4(h, water.kDir);
+}
+
+///
+RWTexture2D<float2> tempTex;
+
+[numthreads(GROUPSIZE, GROUPSIZE, 1)]
+void IFFT_Horizontal (uint3 id : SV_DISPATCHTHREADID)
+{
+    float factorCoe = 1.0 / texN;
+
+    float2 currentHeight = 0;
+
+    for (int i = 0; i < texN; i++)
+    {
+        //去中心化
+        int i_offset = (i + texN / 2.0) % texN;
+        float2 h = spectrumTex[int2(i_offset, id.y)].xy;
+
+        float omegaRotationFactor = 2.0 * PI * (((float)i * id.x) / texN);
+        float2 rotationFactor = float2(cos(omegaRotationFactor), sin(omegaRotationFactor));
+
+        currentHeight += ComplexMul(h, rotationFactor);
+    }
+    currentHeight *= factorCoe;
+
+    tempTex[id.xy] = currentHeight;
+}
+
+
+///
+RWTexture2D<float4> heightTex;
+
+[numthreads(GROUPSIZE, GROUPSIZE, 1)]
+void IFFT_Vertical (uint3 id : SV_DISPATCHTHREADID)
+{
+    float factorCoe = 1.0 / texN;
+
+    float2 currentHeight = 0;
+
+    for (int j = 0; j < texN; j++)
+    {
+        //去中心化
+        int j_offset = (j + texN / 2.0) % texN;
+        float2 h = tempTex[int2(id.x, j_offset)].xy;
+
+        float omegaRotationFactor = 2.0 * PI * (((float)j * id.y) / texN);
+        float2 rotationFactor = float2(cos(omegaRotationFactor), sin(omegaRotationFactor));
+
+        currentHeight += ComplexMul(h, rotationFactor);
+    }
+    currentHeight *= factorCoe;
+
+    heightTex[id.xy] = float4(currentHeight, 0, 0);
+}
+
+///
+RWTexture2D<float4> displacementFrontTex;
+//用来对k的长度进行限制
+float kThreshold;
+
+[numthreads(GROUPSIZE, GROUPSIZE, 1)]
+void GetDisplacementFront (uint3 id : SV_DISPATCHTHREADID)
+{
+    float4 H_K = spectrumTex[id.xy];
+    float2 h = H_K.xy;
+    float2 k = H_K.zw;
+    float2 factor_dx, factor_dy;
+    float kLen = length(k);
+    if (kLen < kThreshold)
+    {
+        factor_dx = 0;
+        factor_dy = 0;
+    }
+    else
+    {
+        factor_dx = (k.x / kLen) * h;
+        factor_dy = (k.y / kLen) * h;
+    }
+
+    float2 coe = float2(0, -1);
+    
+    float2 dx = ComplexMul(coe, factor_dx);
+    float2 dy = ComplexMul(coe, factor_dy);
+
+    displacementFrontTex[id.xy] = float4(dx, dy);
+}
+
+//
+RWTexture2D<float4> tempDisTex;
+
+[numthreads(GROUPSIZE, GROUPSIZE, 1)]
+void IFFT_Horizontal_Dis (uint3 id : SV_DISPATCHTHREADID)
+{
+    float factorCoe = 1.0 / texN;
+
+    float4 currentDis = 0;
+    //xy---dx
+    for (int i = 0; i < texN; i++)
+    {
+        //去中心化
+        int i_offset = (i + texN / 2.0) % texN;
+        float2 h = displacementFrontTex[int2(i_offset, id.y)].xy;
+
+        float omegaRotationFactor = 2.0 * PI * (((float)i * id.x) / texN);
+        float2 rotationFactor = float2(cos(omegaRotationFactor), sin(omegaRotationFactor));
+
+        currentDis.xy += ComplexMul(h, rotationFactor);
+    }
+    currentDis.xy *= factorCoe;
+    //zw---dy
+    for (int j = 0; j < texN; j++)
+    {
+        //去中心化
+        int j_offset = (j + texN / 2.0) % texN;
+        float2 h = displacementFrontTex[int2(j_offset, id.y)].zw;
+
+        float omegaRotationFactor = 2.0 * PI * (((float)j * id.x) / texN);
+        float2 rotationFactor = float2(cos(omegaRotationFactor), sin(omegaRotationFactor));
+
+        currentDis.zw += ComplexMul(h, rotationFactor);
+    }
+    currentDis.zw *= factorCoe;
+
+    tempDisTex[id.xy] = currentDis;
+}
+
+[numthreads(GROUPSIZE, GROUPSIZE, 1)]
+void IFFT_Vertical_Dis (uint3 id : SV_DISPATCHTHREADID)
+{
+    float factorCoe = 1.0 / texN;
+
+    float4 currentDis = 0;
+    //xy---dx
+    for (int i = 0; i < texN; i++)
+    {
+        //去中心化
+        int i_offset = (i + texN / 2.0) % texN;
+        float2 h = tempDisTex[int2(id.x, i_offset)].xy;
+
+        float omegaRotationFactor = 2.0 * PI * (((float)i * id.y) / texN);
+        float2 rotationFactor = float2(cos(omegaRotationFactor), sin(omegaRotationFactor));
+
+        currentDis.xy += ComplexMul(h, rotationFactor);
+    }
+    currentDis.xy *= factorCoe;
+    //zw---dy
+    for (int j = 0; j < texN; j++)
+    {
+        //去中心化
+        int j_offset = (j + texN / 2.0) % texN;
+        float2 h = tempDisTex[int2(id.x, j_offset)].zw;
+
+        float omegaRotationFactor = 2.0 * PI * (((float)j * id.y) / texN);
+        float2 rotationFactor = float2(cos(omegaRotationFactor), sin(omegaRotationFactor));
+
+        currentDis.zw += ComplexMul(h, rotationFactor);
+    }
+    currentDis.zw *= factorCoe;
+
+    heightTex[id.xy] = float4(heightTex[id.xy].xy, currentDis.xz);
+}
+
+
+int ReverseBit(int bit, int m)
+{
+    int res = 0;
+    for (int i = 0; i < m; i++)
+    {
+        if (bit & (1 << i))
+        {
+            res |= 1 << (m - 1 - i);
+        }
+    }
+
+    return res;
+}
+
+//总结段数，用于翻转
+int maxStage;
+//阶段
+int stage;
+
+RWTexture2D<float2> horizontalTexPing;
+RWTexture2D<float2> horizontalTexPong;
+[numthreads(GROUPSIZE, GROUPSIZE, 1)]
+void IFFT_Horizontal_FFT(uint3 id : SV_DISPATCHTHREADID)
+{
+    //第一阶段，stage = 1，N为2
+    int currN = 1 << stage; //pow(2, stage);
+    int halfN = currN >> 1;
+    //当前N中的索引
+    int indexInN = id.x % currN;
+    //半块中的索引，用来计算旋转因子的
+    int k = id.x % halfN;
+
+    float omega = 2 * PI * (float)k / (float)currN;
+    float2 rotationFactor = float2(cos(omega), sin(omega));
+
+    if (indexInN < halfN)
+    {
+        float2 a = horizontalTexPing[int2(id.x, id.y)];
+        float2 b = horizontalTexPing[int2(id.x + halfN, id.y)];
+        horizontalTexPong[id.xy] = a + ComplexMul(rotationFactor, b);
+    }
+    else
+    {
+        float2 a = horizontalTexPing[int2(id.x - halfN, id.y)];
+        float2 b = horizontalTexPing[int2(id.x, id.y)];
+        horizontalTexPong[id.xy] = a - ComplexMul(rotationFactor, b);
+    }
+
+}
+
+RWTexture2D<float2> verticalTexPing;
+RWTexture2D<float2> verticalTexPong;
+[numthreads(GROUPSIZE, GROUPSIZE, 1)]
+void IFFT_Vertical_FFT(uint3 id : SV_DISPATCHTHREADID)
+{
+    //第一阶段，stage = 1，N为2
+    int currN = 1 << stage;
+    int halfN = currN >> 1;
+    //当前N中的索引
+    int indexInN = id.y % currN;
+    //半块中的索引，用来计算旋转因子的
+    int k = id.y % halfN;
+
+    float omega = 2 * PI * (float)k / (float)currN;
+    float2 rotationFactor = float2(cos(omega), sin(omega));
+
+    if (indexInN < halfN)
+    {
+        float2 a = verticalTexPing[int2(id.x, id.y)];
+        float2 b = verticalTexPing[int2(id.x, id.y + halfN)];
+        verticalTexPong[id.xy] = a + ComplexMul(rotationFactor, b);
+    }
+    else
+    {
+        float2 a = verticalTexPing[int2(id.x, id.y - halfN)];
+        float2 b = verticalTexPing[int2(id.x, id.y)];
+        verticalTexPong[id.xy] = a - ComplexMul(rotationFactor, b);
+    }
+}
+
+[numthreads(GROUPSIZE, GROUPSIZE, 1)]
+void IFFT_Horizontal_BitReverse(uint3 id : SV_DISPATCHTHREADID)
+{
+    int index_x = ReverseBit(id.x, maxStage);
+    int index_x_offset = (index_x + texN / 2) % texN;
+
+    horizontalTexPing[id.xy] = spectrumTex[int2(index_x_offset, id.y)].xy;
+}
+
+[numthreads(GROUPSIZE, GROUPSIZE, 1)]
+void IFFT_Vertical_BitReverse(uint3 id : SV_DISPATCHTHREADID)
+{
+    int index_y = ReverseBit(id.y, maxStage);
+
+    int index_y_offset = (index_y + texN / 2) % texN;
+
+    verticalTexPing[id.xy] = horizontalTexPing[int2(id.x, index_y_offset)];
+}
+
+[numthreads(GROUPSIZE, GROUPSIZE, 1)]
+void UpdateHeight(uint3 id : SV_DISPATCHTHREADID)
+{
+    float2 heightValue = verticalTexPing[id.xy].xy / (float)(texN * texN);
+    heightTex[id.xy] = float4(heightValue, 0, 0);
+}
