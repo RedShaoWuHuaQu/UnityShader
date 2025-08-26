@@ -1,0 +1,283 @@
+#pragma kernel UpdateAdvection
+#pragma kernel UpdateDiffusion
+#pragma kernel InitPressure
+#pragma kernel UpdatePressure
+#pragma kernel ApplyPressure
+#pragma kernel BoundaryHandling
+#pragma kernel UpdateUV
+#pragma kernel InitUV
+
+struct ParamsNS
+{
+    float2 velocity;
+};
+
+int _TexN;
+float _StepT;
+float _Time;
+
+float2 _MousePos;
+float2 _MouseDelta;
+float _InfluenceRadius;
+float _InfluenceStrength;
+
+RWStructuredBuffer<ParamsNS> _ParamsData;
+RWTexture2D<float4> _AdvectionTex;
+RWTexture2D<float> _DensityTexOld;
+RWTexture2D<float> _DensityTexNew;
+
+int GetIndex(float2 pos)
+{
+    int index = pos.x + pos.y * _TexN;
+    return index;
+}
+//网格间距
+float _GridSpacing;
+
+[numthreads(8,8,1)]
+void UpdateAdvection (uint3 id : SV_DispatchThreadID)
+{
+    //加鼠标力
+    float2 pos = float2(id.xy);
+    float dist = distance(pos, _MousePos);
+    float2 force = 0;
+    float denForce;
+    if (dist < _InfluenceRadius)
+    {
+        //float influence = (1.0 - dist / _InfluenceRadius);
+        float influence = smoothstep(_InfluenceRadius, 0, dist);
+
+        force = influence * _InfluenceStrength * _MouseDelta;
+        denForce = influence * _InfluenceStrength;
+    }
+
+    int index = id.x + id.y * _TexN;
+    _ParamsData[index].velocity += force;
+
+    ParamsNS data = _ParamsData[index];
+    float2 currentVel = data.velocity;
+
+    float2 prevPos = float2(id.xy) - (_StepT / _GridSpacing) * currentVel;
+    //获取小数部分，用于判断取哪四个点
+    float2 posMin = floor(prevPos);
+    float2 posMax = ceil(prevPos);
+    posMin = clamp(posMin, 0, _TexN - 1);
+    posMax = clamp(posMax, 0, _TexN - 1);
+    //用于插值
+    float2 posDec = prevPos - posMin;
+
+    //
+    float2 pos_00 = posMin;
+    float2 pos_01 = float2(posMin.x, posMax.y);
+    float2 pos_10 = float2(posMax.x, posMin.y);
+    float2 pos_11 = posMax;
+    float2 vel_10 = _ParamsData[GetIndex(pos_10)].velocity;
+    float2 vel_11 = _ParamsData[GetIndex(pos_11)].velocity;
+    float2 vel_00 = _ParamsData[GetIndex(pos_00)].velocity;
+    float2 vel_01 = _ParamsData[GetIndex(pos_01)].velocity;
+
+    //插值
+
+    float2 vel_0 = lerp(vel_00, vel_01, posDec.y);
+    float2 vel_1 = lerp(vel_10, vel_11, posDec.y);
+    float2 vel = lerp(vel_0, vel_1, posDec.x);
+
+    //插值出来的是理论上上一个点的速度，直接将其赋给当前点
+    _AdvectionTex[id.xy] = float4(vel, 0, 0);
+
+    //
+
+    ///////////////////////////////////////////////////////////////////////////////////////////////////////
+
+    float den_10 = _DensityTexOld[pos_10];
+    float den_11 = _DensityTexOld[pos_11];
+    float den_00 = _DensityTexOld[pos_00];
+    float den_01 = _DensityTexOld[pos_01];
+
+    //插值
+
+    float den_0 = lerp(den_00, den_01, posDec.y);
+    float den_1 = lerp(den_10, den_11, posDec.y);
+    float den = lerp(den_0, den_1, posDec.x);
+
+    //插值出来的是理论上上一个点的速度，直接将其赋给当前点
+    _DensityTexNew[id.xy] = den + denForce;
+}
+
+float _ViscosityCoe;
+float _DensityCoe;
+
+RWTexture2D<float4> _DiffusionTex_Read;
+RWTexture2D<float4> _DiffusionTex_Write;
+
+[numthreads(8,8,1)]
+void UpdateDiffusion(uint3 id : SV_DISPATCHTHREADID)
+{
+    int2 idTop = clamp(int2(id.x, id.y + 1), 0, _TexN - 1);
+    int2 idBottom = clamp(int2(id.x, id.y - 1), 0, _TexN - 1);
+    int2 idLeft = clamp(int2(id.x - 1, id.y), 0, _TexN - 1);
+    int2 idRight = clamp(int2(id.x + 1, id.y), 0, _TexN - 1);
+
+    float2 currVel = _DiffusionTex_Read[id.xy].xy;
+    float2 factor = _ViscosityCoe * _StepT / (_GridSpacing * _GridSpacing);
+    float2 nextVel = (currVel + factor * (_DiffusionTex_Read[idTop].xy + _DiffusionTex_Read[idBottom].xy + _DiffusionTex_Read[idLeft].xy + _DiffusionTex_Read[idRight].xy)) / (1.0 + 4.0 * factor);
+    //_StepT必须小于(h^2 / 4v)，不然会发散
+    //float2 nextVel = currVel + _StepT * _ViscosityCoe * nabla2;
+
+    _DiffusionTex_Write[id.xy] = float4(nextVel, 0, 0);
+
+    /////////////////////////////////////////////////////////////////////////////////////
+    
+    float currDen = _DensityTexOld[id.xy];
+    float factorDen = _DensityCoe * _StepT / (_GridSpacing * _GridSpacing);
+    float nextDen = (currDen + factorDen * (_DensityTexOld[idTop] + _DensityTexOld[idBottom] + _DensityTexOld[idLeft] + _DensityTexOld[idRight])) / (1.0 + 4.0 * factorDen);
+
+    _DensityTexNew[id.xy] = nextDen;
+}  
+
+//密度
+float _Density;
+RWTexture2D<float> _PressureTex_Read;
+RWTexture2D<float> _PressureTex_Write;
+
+[numthreads(8, 8, 1)]
+void InitPressure(uint3 id : SV_DISPATCHTHREADID)
+{
+    _PressureTex_Read[id.xy] = 0;
+    _PressureTex_Write[id.xy] = 0;
+}
+
+[numthreads(8, 8, 1)]
+void UpdatePressure(uint3 id : SV_DISPATCHTHREADID)
+{
+    int2 idTop = clamp(int2(id.x, id.y + 1), 0, _TexN - 1);
+    int2 idBottom = clamp(int2(id.x, id.y - 1), 0, _TexN - 1);
+    int2 idLeft = clamp(int2(id.x - 1, id.y), 0, _TexN - 1);
+    int2 idRight = clamp(int2(id.x + 1, id.y), 0, _TexN - 1);
+    //中心处散度
+    float divCenter = (_DiffusionTex_Read[idRight].x - _DiffusionTex_Read[idLeft].x + _DiffusionTex_Read[idTop].y - _DiffusionTex_Read[idBottom].y) / (2 * _GridSpacing);
+    //b的计算
+    float RHS = (_Density / _StepT) * divCenter;
+
+    float pTop = _PressureTex_Read[clamp(int2(id.x, id.y + 1), 0, _TexN - 1)];
+    float pBottom = _PressureTex_Read[clamp(int2(id.x, id.y - 1), 0, _TexN - 1)];
+    float pRight = _PressureTex_Read[clamp(int2(id.x + 1, id.y), 0, _TexN - 1)];
+    float pLeft = _PressureTex_Read[clamp(int2(id.x - 1, id.y), 0, _TexN - 1)];
+
+    float newP = 0.25 * (pTop + pBottom + pRight + pLeft - RHS * _GridSpacing * _GridSpacing);
+
+    _PressureTex_Write[id.xy] = newP;
+}
+
+RWTexture2D<float4> _FinalTex;
+[numthreads(8, 8, 1)]
+void ApplyPressure(uint3 id : SV_DISPATCHTHREADID)
+{
+    float2 currVel = _DiffusionTex_Read[id.xy].xy;
+    float currPres = _PressureTex_Read[id.xy];
+
+    float u_x = currVel.x - (_StepT * (_PressureTex_Read[clamp(int2(id.x + 1, id.y), 0, _TexN - 1)] - _PressureTex_Read[clamp(int2(id.x - 1, id.y), 0, _TexN - 1)])) / (_Density * 2 * _GridSpacing);
+    float u_y = currVel.y - (_StepT * (_PressureTex_Read[clamp(int2(id.x, id.y + 1), 0, _TexN - 1)] - _PressureTex_Read[clamp(int2(id.x, id.y - 1), 0, _TexN - 1)])) / (_Density * 2 * _GridSpacing);
+
+    _ParamsData[id.x + _TexN * id.y].velocity = float2(u_x, u_y);
+    _FinalTex[id.xy] = float4(u_x, u_y, 0, 0);
+}
+
+
+RWTexture2D<float4> _BoundaryHandlingTex;
+
+[numthreads(8, 8, 1)]
+void BoundaryHandling(uint3 id : SV_DISPATCHTHREADID)
+{
+    float vel_x = _BoundaryHandlingTex[id.xy].x;
+    float vel_y = _BoundaryHandlingTex[id.xy].y;
+    uint texN = _TexN;
+
+    if (id.x == 0)
+    {
+        vel_x = -_BoundaryHandlingTex[int2(1, id.y)].x;
+        vel_y = _BoundaryHandlingTex[int2(1, id.y)].y;
+
+    }
+    else if (id.x == texN - 1)
+    {
+        vel_x = -_BoundaryHandlingTex[int2(id.x - 1, id.y)].x;
+        vel_y = _BoundaryHandlingTex[int2(id.x - 1, id.y)].y;
+    }
+
+    if (id.y == 0)
+    {
+        vel_x = _BoundaryHandlingTex[int2(id.x, 1)].x;
+        vel_y = -_BoundaryHandlingTex[int2(id.x, 1)].y;
+    }
+    else if (id.y == texN - 1)
+    {
+        vel_x = _BoundaryHandlingTex[int2(id.x, id.y - 1)].x;
+        vel_y = -_BoundaryHandlingTex[int2(id.x, id.y - 1)].y;
+    }
+    //
+    if (id.x == 0 && id.y == 0) 
+    { 
+        float vel_x1 = -_BoundaryHandlingTex[int2(1, id.y)].x;
+        float vel_y1 = _BoundaryHandlingTex[int2(1, id.y)].y;
+
+        float vel_x2 = _BoundaryHandlingTex[int2(id.x, 1)].x;
+        float vel_y2 = -_BoundaryHandlingTex[int2(id.x, 1)].y;
+
+        vel_x = 0.5 * (vel_x1 + vel_x2);
+        vel_y = 0.5 * (vel_y1 + vel_y2);
+    }
+    else if (id.x == 0 && id.y == texN - 1)
+    {
+        float vel_x1 = -_BoundaryHandlingTex[int2(1, id.y)].x;
+        float vel_y1 = _BoundaryHandlingTex[int2(1, id.y)].y;
+
+        float vel_x2 = _BoundaryHandlingTex[int2(id.x, id.y - 1)].x;
+        float vel_y2 = -_BoundaryHandlingTex[int2(id.x, id.y - 1)].y;
+
+        vel_x = 0.5 * (vel_x1 + vel_x2);
+        vel_y = 0.5 * (vel_y1 + vel_y2);
+    }
+    else if (id.x == texN - 1 && id.y == 0)
+    {
+        float vel_x1 = -_BoundaryHandlingTex[int2(id.x - 1, id.y)].x;
+        float vel_y1 = _BoundaryHandlingTex[int2(id.x - 1, id.y)].y;
+
+        float vel_x2 = _BoundaryHandlingTex[int2(id.x, 1)].x;
+        float vel_y2 = -_BoundaryHandlingTex[int2(id.x, 1)].y;
+
+        vel_x = 0.5 * (vel_x1 + vel_x2);
+        vel_y = 0.5 * (vel_y1 + vel_y2);
+    }
+    else if (id.x == texN - 1 && id.y == texN - 1)
+    {
+        float vel_x1 = -_BoundaryHandlingTex[int2(id.x - 1, id.y)].x;
+        float vel_y1 = _BoundaryHandlingTex[int2(id.x - 1, id.y)].y;
+
+        float vel_x2 = _BoundaryHandlingTex[int2(id.x, id.y - 1)].x;
+        float vel_y2 = -_BoundaryHandlingTex[int2(id.x, id.y - 1)].y;
+
+        vel_x = 0.5 * (vel_x1 + vel_x2);
+        vel_y = 0.5 * (vel_y1 + vel_y2);
+    }
+
+    _BoundaryHandlingTex[id.xy] = float4(vel_x, vel_y, 0, 0);
+}
+
+RWTexture2D<float2> _UVTex;
+[numthreads(8, 8, 1)]
+void InitUV(uint3 id : SV_DISPATCHTHREADID)
+{
+    _UVTex[id.xy] = (float2)id.xy / (float)_TexN;
+}
+
+float _VelocityStrength;
+[numthreads(8, 8, 1)]
+void UpdateUV(uint3 id : SV_DISPATCHTHREADID)
+{
+    float2 uv = _UVTex[id.xy];
+    float2 vel = _FinalTex[id.xy].xy;
+    uv -= vel * _VelocityStrength;
+
+    _UVTex[id.xy] = uv;
+}
