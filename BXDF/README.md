@@ -1,1 +1,4 @@
-BXDF：test。
+一些文件说明：
+1.Tools中的GeneratePreSSLut需要放在任意一个Resources文件夹中.
+2.预积分次表面散射的Lut会生成在Assets/Arts/Textures目录下，如果没这个目录需要创建一下.
+3.BRDF中的ReflectionCube是反射纹理，类型为Cubemap.
