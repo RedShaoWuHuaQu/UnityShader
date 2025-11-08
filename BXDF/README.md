@@ -1,1 +1,0 @@
-BXDF ：BRDF，BTDF与BSSRDF的基础实现
