@@ -1,0 +1,90 @@
+#pragma kernel GetSSLut
+
+#define PI 3.1415926
+
+RWTexture2D<float4> _Result;
+//每个高斯分布的σ，三通道
+RWStructuredBuffer<float> _GaussSigma;
+
+float _TexN;
+//我寻思这个可以换成厚度图
+float _Thickness;
+//采样数量，采的是光照方向
+int _Sample;
+//也是采样数量，采样的是高斯分布的数量，最多6个
+int _GaussSample;
+//每个高斯分布的权重，三通道
+float3 _GaussWeight[6];
+
+float3 Gaussian(float v, float r)
+{
+    return 1.0 / sqrt(2.0 * PI * v) * exp(-(r * r) / (2.0 * v));
+}
+
+float3 ComputeDiffusionProfiles(float r)
+{
+    float3 sum = 0;
+
+    for (int i = 0; i < _GaussSample; i++)
+    {
+        float3 weight = _GaussWeight[i];
+        float sigma = _GaussSigma[i];
+        float3 sampleD = Gaussian(sigma, r) * weight;
+
+        sum += sampleD;
+    }
+
+    return sum;
+}
+
+
+#define A 0.15
+#define B 0.50
+#define C 0.10
+#define D 0.20
+#define E 0.02
+#define F 0.30
+#define W 11.2
+
+float3 Tonemap(float3 x)
+{
+    return ((x * (A * x + C * B) + D * E) / (x * (A * x + B) + D * F)) - E / F;
+}
+
+[numthreads(8,8,1)]
+void GetSSLut (uint3 id : SV_DispatchThreadID)
+{
+
+    float2 uv = (float2)id.xy / (float)_TexN;
+    float r = 1.0 / max(0.00001, uv.y);
+
+    float cos_xita_i = uv.x * 2.0 - 1.0;         
+    float xita_i = acos(cos_xita_i);          //l方向与法线夹角
+
+    float3 totalLight = 0;
+    float3 totalWeight = 0;
+    
+    for (int i = 0; i <= _Sample; i++)
+    {
+        float sample_xita_o = (((float)i / (float)_Sample) * 2 - 1) * PI;
+        float cos_sample = saturate(cos(sample_xita_o + xita_i));
+        float rSample = 2.0 * r * sin(abs(sample_xita_o) * 0.5);
+        //采样得出出射角
+        //射入点与射出点的距离
+        float3 Dd = ComputeDiffusionProfiles(rSample);
+
+        float3 res = cos_sample * Dd;
+
+        totalLight += res;
+        totalWeight += Dd;
+    }
+     
+    float3 res = totalLight / totalWeight;
+
+    float3 toneMap = Tonemap(res * 12.0);
+    float3 whiteScale = 1.0 / Tonemap(float3(W, W, W));
+    res = toneMap * whiteScale;
+
+
+    _Result[id.xy] = float4(res, 1.0);
+}
