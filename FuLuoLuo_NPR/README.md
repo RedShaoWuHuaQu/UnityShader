@@ -1,0 +1,5 @@
+down是up和down的材质的shader
+hair是bangs和hair
+eye是眼睛
+star是声痕
+face是面部
