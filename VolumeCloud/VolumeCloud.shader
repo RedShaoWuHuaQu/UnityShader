@@ -135,7 +135,7 @@ Shader "Models/VolumeCloud"
                 float3 worldPos = mul(unity_CameraToWorld, float4(viewPos, 1.0)).xyz;
 
                 //方法2
-                // float3 clipPos = float3(f.uv.x * 2.0 - 1.0, f.uv.y * 2.0, -1.0) * _ProjectionParams.z;
+                // float3 clipPos = float3(f.uv.x * 2.0 - 1.0, f.uv.y * 2.0 - 1.0, -1.0) * _ProjectionParams.z;
                 // float3 viewDir = normalize(mul(unity_CameraInvProjection , clipPos.xyzz).xyz);
                 // float3 dis = depthEye / viewDir.z;
                 // float3 worldDir = mul((float3x3)unity_CameraToWorld, viewDir);
@@ -450,3 +450,4 @@ Shader "Models/VolumeCloud"
         }
     }
 }
+
