@@ -1,0 +1,257 @@
+#pragma kernel GenerateCloudNoise
+#pragma kernel WorleyNormalize
+
+static const int minMaxConstant = 10000000;
+
+float3 Hash3D(float3 p) 
+{
+    p = float3(
+        dot(p, float3(127.1, 311.7, 74.7)),
+        dot(p, float3(269.5, 183.3, 246.1)),
+        dot(p, float3(113.5, 271.9, 124.6))
+    );
+    return frac(sin(p) * 43758.5453123);
+}
+
+float fade(float t)
+{
+    return t * t * t * (t * (t * 6 - 15) + 10);         
+}
+
+float3 RandomVecPerLin(int3 pos, int frequency)
+{
+    pos = (pos + int3(frequency, frequency, frequency)) % frequency;
+    
+    //两个vec都能实现正常的随机梯度
+    float3 vec = Hash3D(pos);
+    //float3 vec = float3(dot(xyz, float3(127.1, 337.1, 244.5)), dot(xyz, float3(269.5, 183.3, 345.2)), dot(xyz, float3(125.2, 213.8, 348.1)));
+    //映射到-1，1
+    vec = -1 + 2 * frac(sin(vec) * 43758.5453123);
+    return vec;
+}
+
+float NoisePerlin(float3 xyz, int frequency)
+{
+    xyz *= frequency;
+    int3 i = floor(xyz);
+    float3 f = frac(xyz);
+
+    float3 gradBLB = RandomVecPerLin(i + int3(0, 0, 0), frequency);
+    float3 gradBRB = RandomVecPerLin(i + int3(1, 0, 0), frequency);
+    float3 gradTLB = RandomVecPerLin(i + int3(0, 1, 0), frequency);
+    float3 gradTRB = RandomVecPerLin(i + int3(1, 1, 0), frequency);
+    float3 gradBLF = RandomVecPerLin(i + int3(0, 0, 1), frequency);
+    float3 gradBRF = RandomVecPerLin(i + int3(1, 0, 1), frequency);
+    float3 gradTLF = RandomVecPerLin(i + int3(0, 1, 1), frequency);
+    float3 gradTRF = RandomVecPerLin(i + int3(1, 1, 1), frequency);
+
+    float ValueBLB = dot(gradBLB, f);
+    float ValueBRB = dot(gradBRB, f - float3(1.0, 0.0, 0.0));
+    float ValueTLB = dot(gradTLB, f - float3(0.0, 1.0, 0.0));
+    float ValueTRB = dot(gradTRB, f - float3(1.0, 1.0, 0.0));
+    float ValueBLF = dot(gradBLF, f - float3(0.0, 0.0, 1.0));
+    float ValueBRF = dot(gradBRF, f - float3(1.0, 0.0, 1.0));
+    float ValueTLF = dot(gradTLF, f - float3(0.0, 1.0, 1.0));
+    float ValueTRF = dot(gradTRF, f - float3(1.0, 1.0, 1.0));
+
+    f.x = fade(f.x);
+    f.y = fade(f.y);
+    f.z = fade(f.z);
+
+    //x
+    //Buttom Behind
+    float ValueBB = lerp(ValueBLB, ValueBRB, f.x);
+    float ValueTB = lerp(ValueTLB, ValueTRB, f.x);
+
+    float ValueBF = lerp(ValueBLF, ValueBRF, f.x);
+    //Top Front
+    float ValueTF = lerp(ValueTLF, ValueTRF, f.x);
+
+    //y
+    float ValueB = lerp(ValueBB, ValueTB, f.y);
+    float ValueF = lerp(ValueBF, ValueTF, f.y);
+
+    //z
+    float Value = lerp(ValueB, ValueF, f.z);
+
+    return Value * 0.5 + 0.5;
+}
+
+float NoisePerlinAdd(float3 xyz, int addAmount)
+{
+    float value = 0;
+    float amplitude = 0.5;
+    float frequency = 4;
+
+    for (int i = 0; i < addAmount; i++)
+    {
+        value += amplitude * saturate(NoisePerlin(xyz, frequency));
+        amplitude *= 0.5;
+        frequency *= 2;
+    }
+
+    value = pow(value, 1.8);
+
+    return value;
+}
+
+
+float GetMinInVector(float3 vec)
+{
+    return min(vec.x, min(vec.y, vec.z));
+}
+
+float GetMaxInVector(float3 vec)
+{
+    return max(vec.x, max(vec.y, vec.z));
+}
+
+static const int3 offsets[] = 
+{
+    //front
+    int3(-1,  1, -1),
+    int3( 0,  1, -1),
+    int3( 1,  1, -1),
+    int3(-1,  0, -1),
+    int3( 0,  0, -1),
+    int3( 1,  0, -1),
+    int3(-1, -1, -1),
+    int3( 0, -1, -1),
+    int3( 1, -1, -1),
+    //between
+    int3(-1,  1,  0),
+    int3( 0,  1,  0),
+    int3( 1,  1,  0),
+    int3(-1,  0,  0),
+    int3( 0,  0,  0),
+    int3( 1,  0,  0),
+    int3(-1, -1,  0),
+    int3( 0, -1,  0),
+    int3( 1, -1,  0),
+    //behind
+    int3(-1,  1,  1),
+    int3( 0,  1,  1),
+    int3( 1,  1,  1),
+    int3(-1,  0,  1),
+    int3( 0,  0,  1),
+    int3( 1,  0,  1),
+    int3(-1, -1,  1),
+    int3( 0, -1,  1),
+    int3( 1, -1,  1)
+};
+
+//3d
+float WorleyNoise(StructuredBuffer<float3> points, float3 samplePos, int numCell)
+{
+    samplePos *= numCell;
+    
+    int3 intPart = floor(samplePos);
+    
+    
+    float minDis = 1000.0;
+    //初始位置偏移，相对于每个格子的中心点而言
+    for (int i = 0; i < 27; i++)
+    {
+        int3 cellID = intPart + offsets[i];
+        if (GetMinInVector(cellID) <= -0.9 || GetMaxInVector(cellID) >= numCell - 0.1)
+        {
+            int3 wrappedID = (cellID + numCell) % numCell;
+            int wrappedIndex = wrappedID.x + numCell * (wrappedID.y + numCell * wrappedID.z);
+            float3 wrappedPoint = points[wrappedIndex];
+            for (int j = 0; j < 27; j++)
+            {
+                float3 disOffset = samplePos - (wrappedPoint + offsets[j]) * numCell;
+                minDis = min(minDis, dot(disOffset, disOffset));
+            }
+        }
+        else
+        {
+            int cellIndex = cellID.x + numCell * (cellID.y + numCell * cellID.z);
+            float3 disOffset = samplePos - points[cellIndex] * numCell;
+            //平不平方不影响比较
+            minDis = min(minDis, dot(disOffset, disOffset));
+        }
+                
+        // float3 offset = Hash3D(cellID);
+        // float3 moveDir = normalize(Hash3D(cellID + float3(205.1, 135.2, 361.5))) * 2.0 - 1.0;
+        // float speed = Hash3D(cellID + float3(325.1, 245.2, 512.2)).r * 3.0;
+        // float3 feature = float3(i, j, k) + offset + moveDir * sin(time * speed) * 0.3;
+            
+    }
+    
+    return sqrt(minDis);
+}
+RWStructuredBuffer<int> _MinMaxWorley;
+RWStructuredBuffer<int> _MinMaxPerlin;
+RWTexture3D<float4> _CloudTex;
+
+float _TexN;
+
+StructuredBuffer<float3> _PointsA;
+StructuredBuffer<float3> _PointsB;
+StructuredBuffer<float3> _PointsC;
+int _NumCellA;
+int _NumCellB;
+int _NumCellC;
+float _Blend;
+
+float4 _OutChannel;
+
+
+[numthreads(8,8,8)]
+void GenerateCloudNoise (uint3 id : SV_DispatchThreadID)
+{
+    float3 samplePos = id.xyz / _TexN;
+    float perlin = 0;
+    float worley = 0;
+
+    if (_OutChannel.x > 0.9)
+    {
+        perlin = NoisePerlinAdd(samplePos, 5);
+        //perlin = 1 - perlin;
+    }
+
+    if (_OutChannel.y > 0.9)
+    {
+        float worleyA = WorleyNoise(_PointsA, samplePos, _NumCellA);
+        float worleyB = WorleyNoise(_PointsB, samplePos, _NumCellB);
+        float worleyC = WorleyNoise(_PointsC, samplePos, _NumCellC);
+
+        float blend = _Blend;
+        worley = worleyA + worleyB * blend + worleyC * blend * blend;
+        float maxSum = 1 + blend + blend * blend;
+        worley /= maxSum;
+        worley = 1 - worley;
+    }
+
+
+
+    int temp = (int)(worley * minMaxConstant);
+    InterlockedMin(_MinMaxWorley[0], temp);
+    InterlockedMax(_MinMaxWorley[1], temp);
+
+    temp = (int)(perlin * minMaxConstant);
+    InterlockedMin(_MinMaxPerlin[0], temp);
+    InterlockedMax(_MinMaxPerlin[1], temp);
+
+    _CloudTex[id] = _OutChannel * float4(worley, perlin, 0, 1);
+
+}
+
+float NoiseNormalize(RWStructuredBuffer<int> minMax, float noiseVal)
+{
+    float minVal = (float)minMax[0] / minMaxConstant;
+    float maxVal = (float)minMax[1] / minMaxConstant;
+    float nor = (noiseVal - minVal) / (maxVal - minVal);
+
+    return nor;
+}
+
+[numthreads(8, 8, 8)]
+void WorleyNormalize (uint3 id : SV_DispatchThreadID)
+{
+    float perlinNor = NoiseNormalize(_MinMaxPerlin, _CloudTex[id].r);
+    float worleyNor = NoiseNormalize(_MinMaxWorley, _CloudTex[id].g);
+
+    _CloudTex[id] = _OutChannel * float4(worleyNor, perlinNor, 0, 1);
+}
