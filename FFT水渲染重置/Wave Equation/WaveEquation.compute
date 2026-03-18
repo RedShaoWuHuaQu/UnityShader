@@ -1,0 +1,105 @@
+#pragma kernel InitRippleTex
+#pragma kernel UpdateRippleTex
+
+
+#define GROUPSIZE 16
+RWTexture2D<float2> _RipplePrevTex;
+RWTexture2D<float2> _RippleCurrTex;
+RWTexture2D<float2> _RippleNextTex;
+
+[numthreads(GROUPSIZE, GROUPSIZE, 1)]
+void InitRippleTex (uint3 id : SV_DispatchThreadID)
+{
+    _RipplePrevTex[id.xy] = float2(0, 0);
+    _RippleCurrTex[id.xy] = float2(0, 0);
+    _RippleNextTex[id.xy] = float2(0, 0);
+}
+
+int _TexN;
+float _GridSpacing;             //网格间距
+float _DeltaT;                  //Δt
+float _ViscousTerm;             //λ
+float _TransmissionSpeed;       //c
+
+float2 _MouseDelta;
+float2 _TextureMousePos;
+float _VelocityScale;
+float _InfluenceRadius;
+float _InfluenceStrength;
+
+//边界处理方式
+int _BoundaryHandlingMode;
+
+float2 BoundaryHandling(RWTexture2D<float2> tex, int2 pos)
+{
+    float2 value = 0;
+    int2 realPos = pos;
+    if (_BoundaryHandlingMode == 0)
+    {
+        if (pos.x < 0)
+        {
+            realPos.x = -pos.x - 1;
+        }
+        else if (pos.x > _TexN - 1)
+        {
+            realPos.x = 2 * _TexN - pos.x - 1;
+        }
+
+        if (pos.y < 0)
+        {
+            realPos.y = -pos.y - 1;
+        }
+        else if (pos.y > _TexN - 1)
+        {
+            realPos.y = 2 * _TexN - pos.y - 1;
+        }
+        realPos = clamp(realPos, 0, _TexN - 1);
+        value = tex[realPos].xy;
+    }
+    
+    return value;
+}
+
+[numthreads(GROUPSIZE, GROUPSIZE, 1)]
+void UpdateRippleTex(uint3 id : SV_DispatchThreadID)
+{
+    //外力
+    //float dis = distance(_TextureMousePos, id.xy);
+    float2 vel = _MouseDelta;
+    float velLen = length(vel);
+    if (velLen > 0.00001)
+        vel = normalize(vel);
+    else
+        vel = float2(0, 0);
+    
+    float2 sourcePos = _TextureMousePos + vel * velLen * _VelocityScale;
+    float dis = distance(sourcePos, float2(id.xy));
+    float force = 0;
+    if (dis < _InfluenceRadius)
+    {
+        float atten = smoothstep(_InfluenceRadius, 0, dis);
+        force += atten * _InfluenceStrength;
+    }
+
+    //
+
+    float2 ripplePrev = _RipplePrevTex[id.xy].xy;
+    float2 rippleCurr = BoundaryHandling(_RippleCurrTex, id.xy);
+    float factor = (_DeltaT * _TransmissionSpeed) / _GridSpacing;
+    factor *= factor;
+
+    float2 rippleCurrTop = BoundaryHandling(_RippleCurrTex, id.xy + int2(0, 1));
+    float2 rippleCurrBottom = BoundaryHandling(_RippleCurrTex, id.xy + int2(0, -1));
+    float2 rippleCurrLeft = BoundaryHandling(_RippleCurrTex, id.xy + int2(-1, 0));
+    float2 rippleCurrRight = BoundaryHandling(_RippleCurrTex, id.xy + int2(1, 0));
+    float2 laplaceH = rippleCurrTop + rippleCurrBottom + rippleCurrLeft + rippleCurrRight - 4 * rippleCurr;
+    laplaceH *= factor;
+
+    float2 rippleNext = laplaceH + 2 * rippleCurr - ripplePrev;
+    rippleNext += force * _DeltaT * _DeltaT;
+
+    //阻尼
+    rippleNext *= _ViscousTerm;
+
+    _RippleNextTex[id.xy] = rippleNext;
+}
